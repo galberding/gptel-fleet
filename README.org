@@ -1,0 +1,372 @@
+#+title: gptel-fleet
+
+Agent, tool and approval manager on top of [[https://github.com/karthink/gptel-agent][gptel-agent]].
+
+- *Agent list* (=gptel-fleet-list-agents=): a package-menu style overview of every agent, including disabled ones, with backend/model, tool count, policy profile and logged runs.
+- *Per-agent config* as validated lisp-data overrides. The bundled agent files are never touched. This is how a subagent gets its own, cheaper model.
+- *Graded approvals*: =deny= / =escalate= / =dry-run= / =confirm= / =notify= / =allow= per agent, package, tool and argument pattern. They replace gptel's =t= / =nil= / =auto=.
+- *Per-agent tools and skills* assigned from checklists; skills are hidden *and* enforced.
+- *Agent-facing API* (=gptel-fleet-api-*= and =Fleet*= tools): agents can inspect and rewire the fleet, but every change they request waits for your approval.
+- *Tool packages* and *command tools* that run argv lists without a shell.
+- *Forge*: turn a Bash call (from the chat, or the most frequent ones in the logs) into a parameterised tool. Test it in a sandbox, then save it into a package file.
+- *Per-agent JSONL logs* linked parent→child. A reconstruction view splices subagent runs into the main run.
+
+* Setup
+
+#+begin_src emacs-lisp
+(use-package gptel-fleet
+  :straight (:local-repo "~/emacs_setup/packages/gptel-fleet" :type nil)
+  :after gptel-agent
+  :custom
+  (gptel-confirm-tool-calls 'auto)       ; let fleet levels decide
+  (gptel-fleet-approval-ui 'inline)      ; gptel-style inline confirmation (default)
+  :config
+  (gptel-fleet-mode 1)
+  (define-key leader-map (kbd "a l") #'gptel-fleet-list-agents))
+#+end_src
+
+=gptel-fleet-mode= installs everything. Turning it off removes the advices, restores every adopted tool to its original function and confirm flag, and re-runs =gptel-agent-update=.
+
+Files under =gptel-fleet-directory= (default =~/.emacs.d/gptel-fleet/=):
+
+| Path               | Content                                                    |
+|--------------------+------------------------------------------------------------|
+| =agents/NAME.eld=  | per-agent override (plist)                                 |
+| =agent-defs/=      | agents created with =gptel-fleet-new-agent= (added to =gptel-agent-dirs=) |
+| =tools/PKG.el=     | tool packages (written by the forge, or by hand)           |
+| =learned.eld=      | "always allow" answers, as ordinary rules                  |
+| =tool-levels.eld=  | per-tool default levels set from the tools list            |
+| =logs/=            | =index.jsonl=, =<agent>/<date>/<run>.jsonl=, =prompts/<sha1>.md= |
+
+All of them are plain text and git-friendly.
+
+* Agent list — =gptel-fleet-list-agents=
+
+| Key   | Action                                                        |
+|-------+---------------------------------------------------------------|
+| =RET= / =e= | edit the override (=gptel-fleet-config-mode=)          |
+| =s=   | open the agent's =.md= / =.org= definition                    |
+| =i= / =d= / =u= / =x= | mark enable / disable / unmark / execute (like =list-packages=) |
+| =D=   | toggle "may be delegated to"                                  |
+| =M=   | pick =Backend:model= (or =inherit=)                           |
+| =t= / =k= / =K= | checklist of tools / tool packages / skills (see below) |
+| =p=   | policy profile                                                |
+| =P=   | policy matrix: effective level of every tool for this agent   |
+| =L= / =R= | runs of this agent / all runs                             |
+| =T= / =A= | tools list / approval queue                               |
+| =n=   | new agent definition                                          |
+| =a=   | re-register everything (=gptel-fleet-apply=)                  |
+
+** How registration works
+
+=gptel-agent-update= is advised:
+
+1. Disabled agents are dropped *before* gptel-agent expands ={{AGENTS}}=, so other agents' prompts don't list them.
+2. After the update, each override's =:backend=, =:model=, =:tools= / =:tool-packages= and =:preset= are merged into =gptel-agent--agents=. Only gptel-native keys are merged, so gptel never warns about fleet keys.
+3. The =Agent= tool's =subagent_type= enum is rebuilt from enabled agents with =:delegate= ≠ nil. The default matches gptel-agent: everything except =gptel-agent= itself.
+4. Main agents (=gptel-fleet-main-agents=) get a =<fleet_subagents>= roster appended to their system prompt, with each subagent's backend:model. This matters because the bundled =gptel-agent.md= names =introspector= in its prose, not through ={{AGENTS}}=. Without the roster, a disabled agent would still be "known" to the main agent. You can turn this off with =gptel-fleet-append-roster=.
+5. The =gptel-agent= / =gptel-plan= presets are rebuilt, and live main-agent buffers get the preset re-applied (=gptel-fleet-refresh-buffer=).
+
+Subagent models are applied by gptel-agent itself (=gptel-with-preset= in =gptel-agent--task=). The end-to-end test checks this: the main agent runs on =big=, and the delegated researcher's requests arrive at the mock server as =small=.
+
+* Agent config — =gptel-fleet-edit-agent=
+
+#+begin_src lisp-data
+(:enabled t
+ :delegate t
+ :backend "llama-server"
+ :model qwen3-30b-a3b
+ :tools ("Read" "Grep" "Glob")      ; replaces frontmatter tools; omit to inherit
+ :tool-packages (web cargo)         ; added on top
+ :profile readonly
+ :policy ((deny  :tool "Read" :arg :file_path :match "\\.\\(env\\|pem\\)\\'")
+          (allow :package (fs-read web)))
+ :log t
+ :log-dir "~/audit/researcher/"     ; dedicated log directory
+ :preset (:temperature 0.2)
+ :notes "free text")
+#+end_src
+
+Saving validates the file: unknown keys and levels, undefined backends, unknown tools/packages/profiles, invalid regexps. Errors block the save. This runs from =write-contents-functions=, because Emacs 29+ demotes =before-save-hook= errors and would save anyway. Warnings, such as a model not listed for its backend, are shown but don't block. =C-c C-p= shows the policy matrix *with your unsaved edits*. =C-M-i= completes tool names, packages, levels and keys.
+
+Quick actions from the list (=M=, =t=, =D=, …) rewrite the file with =pp=. The header comment is preserved, but inline comments are lost.
+
+* Assigning tools, packages and skills
+
+=t=, =k= and =K= in the agent list (or =M-x gptel-fleet-assign-tools= / =-packages= / =-skills=) open a checklist of every candidate with its group and description:
+
+| Key | |
+|-----+---|
+| =m= / =u= / =SPC= | mark / unmark / toggle |
+| =*= / =U= | all / none |
+| =C-c C-c= or =x= | save into the override, re-register, refresh live buffers |
+| =i= | remove the key: the agent inherits again |
+| =q= | quit without saving |
+
+The header shows whether the agent currently inherits or has an explicit list.
+
+- *Tools* (=:tools=) replace the frontmatter list. *Packages* (=:tool-packages=) add every tool in a package, so a GitLab review agent gets =gitlab= and the researcher gets =web=.
+- With =gptel-fleet-auto-packages= (default on), every tool that belongs to no package goes into a package named after its gptel category. MCP tools carry their server name as category, so connecting a GitLab MCP server creates a =gitlab= package automatically, ready to hand to one agent.
+
+** Skills
+
+gptel-agent expands ={{SKILLS}}= the same way for every agent. =:skills= changes that per agent:
+
+| =:skills= | Effect |
+|-----------+--------|
+| absent | all skills (gptel-agent default) |
+| =()= | none: the skills block is emptied and the =Skill= tool removed |
+| =("pdf" "gitlab-*")= | only these; glob patterns allowed |
+
+Two layers:
+1. *Visibility*: the agent's =<available_skills>= block is replaced by a filtered one. It is appended if the prompt has no ={{SKILLS}}= but the agent has the =Skill= tool.
+2. *Enforcement*: a =Skill= call for a skill outside the set is denied right after the floor rules, before any agent rule. A model that guesses a name it wasn't shown still gets nothing, and the denial is logged with the reason.
+
+The checklist keeps glob entries as they are and only edits explicit names. If you unmark a skill that a glob still covers, it warns you that the skill stays visible.
+
+** Registering a new skill without restarting
+
+gptel-agent scans the skill folders when it builds its agents, normally at Emacs start. To use a skill you (or an agent with your skill-creating skill) just wrote:
+
+- =M-x gptel-fleet-register-skill= on the skill folder or its =SKILL.md= (the default is the file you're visiting), or =+= in the skills checklist (=K=), which also marks it there.
+- It checks the skill first:
+  - =name:= and =description:= must be present;
+  - it warns if the name differs from the folder name, or if the name already exists elsewhere;
+  - the skill must be inside =gptel-agent-skill-dirs=.
+- Then it loads it immediately and optionally adds it to agents that have their own =:skills= list. Agents inheriting all skills see it right away; =g-*= style globs pick it up automatically.
+- For agents: =gptel-fleet-api-register-skill= / tool =FleetRegisterSkill=. Like every agent change, it waits for your approval; the request shows the =SKILL.md= and which agents will see it. An agent may register a skill, but not add it to its own list.
+
+* Approval levels
+
+| Level      | Runs? | What the model gets / what you see                                     |
+|------------+-------+------------------------------------------------------------------------|
+| =deny=     | no    | error string with the rule that denied it, no dialog                   |
+| =escalate= | no    | subagent: "put an =<escalation>= block in your final report"; main agent: treated as =confirm= |
+| =dry-run=  | no    | "would have run X with Y" (useful for watching a new agent)            |
+| =confirm=  | after you answer | gptel's inline confirmation in the chat; also listed in the queue |
+| =notify=   | yes   | echo-area message                                                      |
+| =allow=    | yes   | nothing                                                                |
+
+Every call is logged regardless of its level.
+
+** Rule syntax
+
+=(LEVEL . MATCHER)=. The matcher keys are:
+=:tool=, =:package=, =:agent= (strings/symbols or lists),
+=:arg :command= plus one of =:match= =:equal= =:under= =:not-under= =:any-segment= =:all-segments=,
+=:args ((:path :under "~/proj") (:command :match "…"))= (all must hold), and
+=:pred FN= (called with =TOOL ARGS AGENT=). An empty matcher matches everything.
+
+=:any-segment= / =:all-segments= split shell commands on =&&= =||= =;= =|= and newlines, outside quotes:
+- deny rules should use =:any-segment=: =make && git push= is caught.
+- allow rules should use =:all-segments=: =ls && rm -rf x= is *not* allowed by an "ls" rule.
+
+Heredoc bodies become extra segments, so allow rules fail closed on them.
+
+** Resolution order (first hit wins)
+
+1. =gptel-fleet-floor-rules=: a global floor nothing can loosen. Ships with =rm -rf /= → deny and =git push= → escalate. Then the skill gate: =Skill= calls outside the agent's =:skills= → deny.
+2. the agent's =:policy=
+3. learned rules: session first, then =learned.eld=
+4. the agent's =:profile= (=gptel-fleet-profiles=: =readonly=, =executor=, =trusted=)
+5. =gptel-fleet-global-rules=
+6. tool default: =tool-levels.eld=, then the level in the tool definition, then the package level
+7. for adopted tools without one: the tool's *original* =:confirm= slot (=confirm= or =allow=). Turning on the mode therefore changes no behaviour until you add rules.
+8. =gptel-fleet-default-level= (=confirm=)
+
+** Answering =confirm=
+
+Nothing pops up and nothing times out.
+
+*Inline, in the chat buffer* (=gptel-fleet-approval-ui= = =inline=, the default):
+- Fleet decides the level *before* gptel runs the call, with the right agent identity, also for subagents.
+- For =confirm= it asks gptel to show its own inline confirmation, inside the subagent's task overlay for subagent calls: =C-c C-c= run, =C-c C-k= cancel (resumable), =C-c C-r= steer, =C-c C-i= inspect/edit.
+- gptel's previews (diff for Edit, highlighted command for Bash) work as usual.
+- When the approved call finally runs, fleet still knows which agent it belongs to, so the log and the run tree stay correct.
+
+*Queue buffer* =M-x gptel-fleet-approvals= (or click =Fleet:N= in the mode line):
+- It lists everything that waits: gptel's inline calls from all chat buffers, and fleet's own requests (agent-API changes with diffs, and calls made outside gptel's flow).
+- With =gptel-fleet-approval-ui= = =queue=, every =confirm= call waits here instead of inline.
+
+| Key | Meaning |
+|-----+---------|
+| =y= | run |
+| =s= / =S= | run and allow these exact args / this tool, for the session |
+| =a= / =A= | same, saved to =learned.eld= |
+| =n= | reject |
+| =d= | reject with a reason sent to the model (inline calls: gptel steer) |
+| =e= (also =C-c '=) | edit: fleet requests open the edit buffer below; inline calls open gptel's inspect buffer |
+| =RET= | show the call; for inline calls, jump to it in the chat buffer |
+| =g= | refresh |
+
+=M-x gptel-fleet-approve-next= answers the oldest fleet request in the minibuffer, but only when you call it.
+
+*Editing a call (=e=).* The call opens in a buffer with the fitting major mode:
+- Bash command: =bash-ts-mode= / =sh-mode=
+- Eval: =emacs-lisp-mode=
+- =Edit= / =Write= / =Insert= content: the mode of the target file
+- =Edit= in diff mode: =diff-mode=
+- =Fleet*= specs: =lisp-data-mode=
+- everything else: =text-mode=
+
+Keys:
+- =C-c C-c=, =C-c '= or =C-c C-'= submits the edited call;
+- =C-c C-a= switches to another argument (your edit is kept);
+- =C-c C-k= goes back to the queue, and the call stays pending.
+
+Lisp buffers refuse to submit with unbalanced parens. Mode hooks are not run, so no eglot/LSP starts in these file-less buffers (=gptel-fleet-edit-run-mode-hooks=). Extra mappings go in =gptel-fleet-edit-modes=. The edited call is logged as an =approval-edit= event.
+
+Unattended runs: calls simply wait, inline or in the queue, until you get to them. Agents that don't need approval keep working in the meantime.
+
+* Tools
+
+** Packages
+Existing tools are grouped by =gptel-fleet-builtin-packages=:
+=fs-read= (Read Glob Grep), =fs-write= (Write Edit Insert Mkdir), =web=, =shell= (Bash), =emacs= (Eval Diagnostics), =emacs-introspection=, =orchestration= (Agent TodoWrite Skill).
+
+*Adoption* wraps every gptel tool, including MCP tools registered later (=gptel-make-tool= is advised). It swaps the tool's function for a guarded wrapper and sets =:confirm nil=, so fleet *replaces* gptel's confirmation instead of stacking another one on top. You can limit this with =gptel-fleet-adopt-tools=.
+
+** Command tools
+See =examples/cargo.el=. A =:command= template becomes an argv list for =make-process=: no shell, no quoting, no =&&= chains for a guard to parse. On top of that:
+- Positional arg values starting with =-= are rejected. This prevents option injection; per arg, =:allow-dash t= turns it off.
+- =:inherit-env nil= starts from =gptel-fleet-minimal-env=, so tools that don't need tokens never see them.
+- =:sandbox t= wraps the call in bubblewrap (read-only root, writable cwd, =--unshare-net=), or in any function you set as =gptel-fleet-sandbox-function=.
+- =:tail= / =:head= / =:max-output= replace =| tail -n=.
+
+* Forge
+
+| Entry point | Source |
+|-------------+--------|
+| =gptel-fleet-bash-stats= | all logged Bash calls grouped by signature (=cargo test=, =git log \| head=…), most frequent first. *Start here*: it shows which tools are worth making. =RET= forges from the latest call. |
+| =gptel-fleet-forge-from-log= | the same, through completing-read |
+| =gptel-fleet-forge-from-call-at-point= | a tool-call block in a gptel chat buffer (markdown or org) |
+| =gptel-fleet-forge-from-command= | a command you type |
+| =gptel-fleet-forge-edit-tool= / tools list =f= | an existing fleet tool |
+
+The draft generator:
+- strips =cd DIR &&= (→ =:cwd=), =2>&1=, =2>/dev/null= (→ =:stderr drop=) and =| tail -N= / =| head -N= (→ =:tail= / =:head=)
+- asks which tokens become arguments. A chosen value after a flag absorbs the flag as =(:opt "-p" package)=.
+- records the original values as the first =:examples= entry
+
+For a pipeline, only the first segment is converted, and the draft says so.
+
+| Key | In the forge buffer |
+|-----+---------------------|
+| =C-c C-r= | render: the argv each example would execute (nothing runs) |
+| =C-c C-t= | test in =bwrap-ro= (nothing can change), =bwrap= (cwd writable), =tmpdir= or =direct=; shows the original output from the chat/log next to it |
+| =C-c C-e= | run all =:examples= (regression check after edits) |
+| =C-c C-c= | validate, write into =tools/<package>.el= (replacing an existing definition), load, optionally add the package to agents, re-register |
+
+Validation catches template args that don't exist, unused args, a bad level or name, a missing program, and the placeholder description still being there.
+
+* Letting agents manage the fleet
+
+One public API, used by you (=M-:=), by agents through =Eval=, and by the =fleet= tool package:
+
+| Function | Fleet tool | |
+|----------+------------+---|
+| =gptel-fleet-api-overview= | =FleetOverview= | architecture, levels, rule syntax and the live state of agents, packages, skills and backends, in one call |
+| =gptel-fleet-api-agent= | =FleetAgent= | one agent: override, effective tools/skills/model, per-tool levels |
+| =gptel-fleet-api-explain= | =FleetExplain= | which level a call would get, and which rule decides it |
+| =gptel-fleet-api-status= | =FleetStatus= | status of a requested change |
+| =gptel-fleet-api-set= | =FleetSet= | set or =:unset= one override key |
+| =gptel-fleet-api-assign= | =FleetAssign= | tools / packages / skills, or =:inherit= |
+| =gptel-fleet-api-add-rule= / =-remove-rule= | =FleetAddRule= | edit =:policy= |
+| =gptel-fleet-api-new-agent= | =FleetNewAgent= | new agent, created *disabled* with profile =readonly= |
+| =gptel-fleet-api-define-tool= | =FleetDefineTool= | command tool (argv, no shell) |
+| =gptel-fleet-api-register-skill= | =FleetRegisterSkill= | load a newly written skill now, optionally add it to agents |
+| =gptel-fleet-api-set-tool-level= | — | default level of a tool |
+
+*The approval lives inside the functions, not on the tools.*
+- When one of them is called while an agent's tool call is running (fleet tracks this for =Fleet*= tools, =Eval= and nested agents alike), the change is checked and queued. The agent immediately gets =PENDING chg-…= and can poll =FleetStatus=.
+- When you call them yourself, they apply directly.
+
+The approval request shows:
+- which agent asked, and through which tool;
+- a =⚠ WIDENS= list (looser levels, added tools/packages/skills, enabling, model changes, keys removed so defaults are inherited);
+- every (agent, tool) level that changes, before → after;
+- the unified diff of each override file.
+
+Learning answers (=s= =S= =a= =A=) and editing args (=e=) are disabled for these requests.
+
+Refused outright (not queued):
+- invalid changes;
+- =:function= tools from agents (arbitrary code);
+- *any change that widens the requesting agent itself or the agent that spawned it*. Narrowing yourself is allowed.
+
+Applied changes are re-registered, committed to git in =gptel-fleet-directory= (=logs/= ignored), with the requesting agent as author, and logged as =fleet-change= events in the run.
+
+Side doors are covered by floor rules (=confirm=):
+- =Write= / =Edit= / =Insert= / =Mkdir= / =Bash= calls whose arguments point into the fleet directory;
+- =Eval= expressions that use fleet symbols other than =gptel-fleet-api-*=.
+
+Caveat: =Eval= runs arbitrary code. These rules catch accidents and well-meaning agents, not an adversary who obfuscates symbol names. =Eval= itself stays at its own level (=confirm= by default).
+
+* Logs and reconstruction
+
+Each run (one subagent task, or one chat buffer of a main agent) writes =<log-dir>/<date>/<run>.jsonl=. The event types are:
+=run-start= (agent, parent, task prompt, backend, model, tools, system-prompt sha), =prompt=, =spawn= / =spawn-end= (in the parent), =decision=, =tool-call=, =tool-result=, =approval=, =response=, =run-end= (the final report), and =request= (full payloads if =gptel-fleet-log-payloads=).
+
+System prompts are stored once under =logs/prompts/<sha1>.md=, so each run file says exactly which prompt version an agent ran with.
+
+=gptel-fleet-list-runs= → =RET= (or =gptel-fleet-log-reconstruct=) renders an org tree. Each subagent run is inserted at the point in the parent where it was spawned, recursively for nested delegation. =T= starts from the root of the tree. =f= opens the raw JSONL.
+
+How the identity of the calling agent reaches the log and the policy:
+- =gptel-agent--task= is advised to create a child context.
+- =gptel-request= is advised to stamp that context into the new FSM's info (=:gptel-fleet=).
+- The handlers in =gptel-agent-request--handlers= are wrapped to bind it.
+
+Tool wrappers, gptel's pre/post tool hooks and nested =Agent= calls therefore all see the right agent. The main chat buffer uses its own context.
+
+* Tests
+
+#+begin_src sh
+make test LOADPATH="-L ~/.emacs.d/straight/build/gptel -L ~/.emacs.d/straight/build/gptel-agent -L ~/.emacs.d/straight/build/yaml -L ~/.emacs.d/straight/build/compat"
+#+end_src
+
+The suite has 24 ERT tests, plus the interactive suites below. =gptel-fleet-test-end-to-end= starts =test/mock_llm.py=, a deterministic OpenAI-compatible mock, and runs this flow through real gptel and gptel-agent:
+1. the main agent (model =big=) delegates to the researcher (model =small=)
+2. the researcher reads a file (allowed), then tries =echo hi && git push origin main=, which hits the floor rule → escalate
+3. the test asserts the models used, the parent/child log linkage, the decisions, and the reconstructed tree
+
+* Interactive tests
+
+Tool approvals and agent changes are mostly interactive, so they get their own two test layers on top of ERT (=make test=).
+
+** Ecukes (=make ecukes=)
+
+Gherkin features in =features/=, run in batch with real key sequences (Espuds steps plus fleet steps in =features/step-definitions/=). Every scenario gets a fresh fleet folder, a fresh mock LLM and a chat buffer.
+
+| Feature | Scenarios |
+|---------+-----------|
+| =inline-approval= | a subagent call waits inline → =C-c C-c= in the overlay; approve from the queue with =y=; reject with =C-c C-k= |
+| =queue-and-edit= | a Bash call waits in the queue → =e= opens an =sh-mode= buffer → edit → =C-c '=; =C-c C-k= leaves the call waiting, =n= rejects |
+| =agent-modification= | =M= model change; =t= checklist adds a tool; =i= inherit; an agent asks to change another agent → review the diff → =y= |
+
+Along the way they also check that nothing pops up, that the mode-line counter is right, that the queue and detail windows close, and that the edited command reaches the model.
+
+=ECUKES_DEPS= points at checkouts of ecukes, espuds, ansi, commander, dash, s and f. With straight, use the =straight/build/…= folders.
+
+** Terminal UI under tmux (=make tmux=)
+
+=test/interactive/tmux_scenarios.py= starts =emacs -nw= in tmux with =test/interactive/fleet-init.el=, sends keys with =tmux send-keys=, waits for text with =capture-pane=, and saves every screen it looked at under =test/interactive/screens/=. This is for reading what you would actually see: window layout, overlays, mode line, header lines. Scenarios: =inline-ack=, =queue-ack=, =edit-bash=, =agent-list=, =fleet-api=. =FLEET_LOADPATH= selects gptel/gptel-agent checkouts.
+
+To try it by hand:
+#+begin_src sh
+FLEET_ROOT=$PWD FLEET_DIR=$(mktemp -d) FLEET_PORT=8765 FLEET_SCENARIO=delegate \
+  emacs -nw -Q -l test/interactive/fleet-init.el    # with test/mock_llm.py 8765 ... running
+#+end_src
+F5 sends the prepared prompt.
+
+* Limitations / things to know
+
+- *Depends on gptel-agent internals*: =gptel-agent--task= (signature), =gptel-agent-request--handlers=, =gptel-agent--agents=, =gptel-agent--update-agents=, plus gptel's =gptel--apply-preset=, =gptel-fsm-info= and =gptel--known-tools=. Tested against gptel 2026-10-18 and gptel-agent 2026-10-11. =M-x gptel-fleet-mode= off/on after upgrading is cheap; the e2e test is the canary.
+- =gptel-confirm-tool-calls= no longer matters for guarded tools: fleet tells gptel per call whether to ask (=:confirm= in =gptel-pre-tool-call-functions=, a documented hook).
+- *Escalation is advisory*. The subagent reports the needed call and the orchestrator decides. Nothing is re-executed automatically.
+- Newer gptel also has =:block= in =gptel-pre-tool-call-functions= (marked "not final" upstream). Fleet deliberately uses function wrapping instead, which doesn't depend on that API.
+- Main-agent prompt logging takes the text before point back to the last response, which is a heuristic. Subagent intermediate text is only in =run-end= (gptel-agent concatenates it), unless =gptel-fleet-log-payloads= is on.
+- Fleet-defined tools stay registered when the mode is turned off; only adopted tools are restored.
+
+* License
+
+GPL-3.0-or-later, same as gptel and gptel-agent. See =LICENSE=.
