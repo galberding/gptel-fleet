@@ -36,6 +36,8 @@
 (declare-function gptel--reject-tool-calls "gptel")
 (declare-function gptel--steer-tool-calls "gptel")
 (declare-function gptel--inspect-tool-calls "gptel")
+(declare-function gptel-fleet-ask-answer-inline "gptel-fleet-ask")
+(declare-function gptel-fleet-ask-answer-request "gptel-fleet-ask")
 
 (defcustom gptel-fleet-approval-ui 'inline
   "Where `confirm' calls are approved.
@@ -159,6 +161,14 @@ actually used: %s]\n" (prin1-to-string (gptel-fleet-request-args req)))))
 
 (defun gptel-fleet-answer (req key)
   "Apply answer KEY (a character) to REQ."
+  (if (equal (gptel-fleet-request-tool-name req) "AskUser")
+      (pcase key
+        ((or ?y ?e ?s ?S ?a ?A) (gptel-fleet-ask-answer-request req))
+        ((or ?n ?d) (gptel-fleet-ask-answer-request req t)))
+    (gptel-fleet--answer-change-or-call req key)))
+
+(defun gptel-fleet--answer-change-or-call (req key)
+  "Apply answer KEY to REQ, a tool call or fleet change."
   (let ((agent (plist-get (gptel-fleet-request-ctx req) :agent)))
     (when (and (gptel-fleet-request-no-learn req) (memq key '(?s ?S ?a ?A ?e)))
       (message "gptel-fleet: this request cannot be learned or edited; treated as `y'")
@@ -471,7 +481,12 @@ VALUES is the working copy of all argument values (default: REQ's)."
                                 (mapconcat (lambda (c) (gptel-tool-name (car c))) calls ",")
                                 (format "inline %s" (buffer-name buf))
                                 (gptel-fleet--one-line
-                                 (mapconcat (lambda (c) (prin1-to-string (cadr c))) calls " ")
+                                 (mapconcat (lambda (c)
+                                              (let ((m (plist-get (cadr c) :model)))
+                                                (concat (if (gptel-fleet--set-p m)
+                                                            (format "[model %s] " m) "")
+                                                        (prin1-to-string (cadr c)))))
+                                            calls " ")
                                  120))))
          (mapcar (lambda (req)
                    (list req
@@ -483,59 +498,144 @@ VALUES is the working copy of all argument values (default: REQ's)."
                                   (prin1-to-string (gptel-fleet-request-args req)) 120))))
                  gptel-fleet--queue))))
 
+(defmacro gptel-fleet--define-queue-command (name key doc)
+  "Define approval-queue command NAME answering with KEY, documented by DOC."
+  `(defun ,name ()
+     ,(concat doc "\nActs on the entry at point in the approval queue.")
+     (interactive)
+     (gptel-fleet--queue-answer ,key)))
+
+(gptel-fleet--define-queue-command gptel-fleet-approvals-run-once ?y
+  "Run the call once.  For a question (AskUser): answer it.")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-allow-exact-session ?s
+  "Run it, and allow these exact arguments for this agent until Emacs exits.")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-allow-tool-session ?S
+  "Run it, and allow this tool with any arguments for this agent until Emacs exits.")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-allow-exact-always ?a
+  "Run it, and always allow these exact arguments for this agent.
+The rule is saved to the learned rules (`gptel-fleet-edit-learned').")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-allow-tool-always ?A
+  "Run it, and always allow this tool with any arguments for this agent.
+The rule is saved to the learned rules (`gptel-fleet-edit-learned').")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-deny ?n
+  "Deny the call.  For a question (AskUser): decline to answer.")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-deny-with-reason ?d
+  "Deny the call and send a reason to the model.
+Inline calls jump to the chat buffer to steer from there.")
+(gptel-fleet--define-queue-command gptel-fleet-approvals-edit ?e
+  "Edit the call's arguments in a buffer before deciding.
+Inline calls jump to the chat buffer and open gptel's inspector.")
+
+(defun gptel-fleet-approvals-refresh ()
+  "Re-read pending calls and redraw the approval queue."
+  (interactive)
+  (gptel-fleet-update-indicator))
+
 (defvar-keymap gptel-fleet-approvals-mode-map
   :parent tabulated-list-mode-map
-  "y" (lambda () (interactive) (gptel-fleet--queue-answer ?y))
-  "s" (lambda () (interactive) (gptel-fleet--queue-answer ?s))
-  "S" (lambda () (interactive) (gptel-fleet--queue-answer ?S))
-  "a" (lambda () (interactive) (gptel-fleet--queue-answer ?a))
-  "A" (lambda () (interactive) (gptel-fleet--queue-answer ?A))
-  "n" (lambda () (interactive) (gptel-fleet--queue-answer ?n))
-  "d" (lambda () (interactive) (gptel-fleet--queue-answer ?d))
-  "e" (lambda () (interactive) (gptel-fleet--queue-answer ?e))
-  "C-c '" (lambda () (interactive) (gptel-fleet--queue-answer ?e))
-  "C-c C-'" (lambda () (interactive) (gptel-fleet--queue-answer ?e))
+  "y" #'gptel-fleet-approvals-run-once
+  "s" #'gptel-fleet-approvals-allow-exact-session
+  "S" #'gptel-fleet-approvals-allow-tool-session
+  "a" #'gptel-fleet-approvals-allow-exact-always
+  "A" #'gptel-fleet-approvals-allow-tool-always
+  "n" #'gptel-fleet-approvals-deny
+  "d" #'gptel-fleet-approvals-deny-with-reason
+  "e" #'gptel-fleet-approvals-edit
+  "C-c '" #'gptel-fleet-approvals-edit
+  "C-c C-'" #'gptel-fleet-approvals-edit
   "RET" #'gptel-fleet-approvals-show
-  "g" #'gptel-fleet-update-indicator)
+  "g" #'gptel-fleet-approvals-refresh)
 
 (define-derived-mode gptel-fleet-approvals-mode tabulated-list-mode "Fleet-Approvals"
-  "Calls waiting for a human decision: gptel inline calls and fleet requests.
+  "Calls waiting for your decision, from every agent in one list.
+
+Each row is one pending call.  The Where column says which kind:
+  inline BUFFER  a call shown in that gptel chat buffer (main agent
+                 or a subagent running inside it)
+  queue          a fleet request (subagent escalations, fleet changes)
+Rows for AskUser are questions: answering runs them, denying declines.
+
+Deciding (on the row at point):
+  \\[gptel-fleet-approvals-run-once]  run once                \
+\\[gptel-fleet-approvals-deny]  deny
+  \\[gptel-fleet-approvals-deny-with-reason]  deny, with a reason sent to the model
+  \\[gptel-fleet-approvals-edit]  edit the arguments first
+Running and learning a rule for this agent:
+  \\[gptel-fleet-approvals-allow-exact-session]  these exact args, this session   \
+\\[gptel-fleet-approvals-allow-exact-always]  these exact args, always
+  \\[gptel-fleet-approvals-allow-tool-session]  this tool, this session          \
+\\[gptel-fleet-approvals-allow-tool-always]  this tool, always
+\"Always\" rules are saved; review them with `gptel-fleet-edit-learned'.
+Floor rules (`gptel-fleet-floor-rules') still apply over learned rules.
+
+Other:
+  \\[gptel-fleet-approvals-show]  show the full call (inline: jump to the chat)
+  \\[gptel-fleet-approvals-refresh]  refresh
+  \\[quit-window]  quit
+
+All bindings:
 \\{gptel-fleet-approvals-mode-map}"
   (setq tabulated-list-format [("Time" 9 t) ("Agent" 16 t) ("Tool" 16 t)
                                ("Where" 24 t) ("Args" 0 nil)])
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
 
+(defun gptel-fleet--inline-call-position (ov)
+  "Position of the pending calls' prompt inside gptel's tool overlay OV.
+OV itself starts at the beginning of the whole response (or of the
+buffer), often far above the calls.  The \"... wants to run:\" header
+is drawn before gptel's prompt overlays; a question has its own overlay."
+  (with-current-buffer (overlay-buffer ov)
+    (or (when-let* ((ask (cl-find-if (lambda (o) (overlay-get o 'gptel-fleet-ask))
+                                     (overlays-in (overlay-start ov) (overlay-end ov)))))
+          (overlay-start ask))
+        (cl-loop for p in (overlay-get ov 'prompt)
+                 when (overlay-buffer p) minimize (overlay-start p))
+        (overlay-end ov))))
+
 (defun gptel-fleet--inline-jump (buf ov &optional command)
-  "Show the inline call OV in BUF; run COMMAND there interactively."
-  (pop-to-buffer buf)
-  (goto-char (overlay-start ov))
+  "Show the inline call OV in BUF at its prompt; run COMMAND there interactively."
+  (let ((pos (gptel-fleet--inline-call-position ov)))
+    (pop-to-buffer buf)
+    (goto-char pos)
+    (when (eq (window-buffer) buf)
+      (recenter)))
   (when command (call-interactively command)))
 
 (defun gptel-fleet--answer-inline (entry key)
   "Answer inline ENTRY (inline BUF OV CALLS) with KEY."
   (pcase-let ((`(inline ,buf ,ov ,calls) entry))
     (unless (overlay-buffer ov) (user-error "Already answered"))
-    (when (memq key '(?s ?S ?a ?A))
-      (dolist (c calls)
-        (let* ((tok (gptel-fleet--inline-token c))
-               (agent (plist-get (plist-get tok :ctx) :agent))
-               (tool (gptel-tool-name (car c))))
-          (when agent
-            (gptel-fleet-learn
-             agent
-             (if (memq key '(?S ?A)) `(allow :tool ,tool)
-               `(allow :tool ,tool
-                       :args ,(cl-loop for (k v) on (cadr c) by #'cddr
-                                       collect (list k :equal v))))
-             (memq key '(?a ?A)))))))
-    (pcase key
-      ((or ?y ?s ?S ?a ?A)
-       (with-current-buffer buf (gptel--accept-tool-calls calls ov)))
-      (?n (with-current-buffer buf (gptel--reject-tool-calls calls ov)))
-      (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls))
-      (?e (gptel-fleet--inline-jump buf ov #'gptel--inspect-tool-calls)))
+    (if (cl-some (lambda (c) (equal (gptel-tool-name (car c)) "AskUser")) calls)
+        ;; A question: answer it (minibuffer, since you asked for it here).
+        (pcase key
+          ((or ?y ?e ?s ?S ?a ?A) (gptel-fleet-ask-answer-inline buf ov calls))
+          (?n (gptel-fleet-ask-answer-inline buf ov calls t))
+          (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls)))
+      (gptel-fleet--answer-inline-call buf ov calls key))
     (gptel-fleet-update-indicator)))
+
+(defun gptel-fleet--answer-inline-call (buf ov calls key)
+  "Answer gptel's pending CALLS at OV in BUF with KEY."
+  (when (memq key '(?s ?S ?a ?A))
+    (dolist (c calls)
+      (let* ((tok (gptel-fleet--inline-token c))
+             (agent (plist-get (plist-get tok :ctx) :agent))
+             (tool (gptel-tool-name (car c))))
+        (when agent
+          (gptel-fleet-learn
+           agent
+           (if (memq key '(?S ?A)) `(allow :tool ,tool)
+             `(allow :tool ,tool
+                     :args ,(cl-loop for (k v) on (cadr c) by #'cddr
+                                     collect (list k :equal v))))
+           (memq key '(?a ?A)))))))
+  (pcase key
+    ((or ?y ?s ?S ?a ?A)
+     (with-current-buffer buf (gptel--accept-tool-calls calls ov)))
+    (?n (with-current-buffer buf (gptel--reject-tool-calls calls ov)))
+    (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls))
+    (?e (gptel-fleet--inline-jump buf ov #'gptel--inspect-tool-calls))))
 
 (defun gptel-fleet--queue-answer (key)
   "Answer the entry at point with KEY."

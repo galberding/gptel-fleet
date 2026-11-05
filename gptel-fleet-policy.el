@@ -321,6 +321,15 @@ allow rules conservative (they simply fail to match)."
             "original :confirm"))
      (t nil))))
 
+(defvar gptel-fleet-decide-post-functions nil
+  "Functions called as (AGENT TOOL-NAME ARGS DECISION) after a decision.
+Each returns DECISION, possibly made stricter.  Used for checks that
+must hold whatever rule matched, such as per-task model overrides.")
+
+(defun gptel-fleet--level-rank-of (level)
+  "Looseness rank of LEVEL: 0 for deny ... 5 for allow."
+  (or (cl-position level gptel-fleet-levels) 0))
+
 (defun gptel-fleet-decide (agent tool-name args &optional main-p)
   "Return (LEVEL . SOURCE) for AGENT calling TOOL-NAME with ARGS plist.
 MAIN-P non-nil means AGENT is a top-level agent (escalate -> confirm)."
@@ -361,12 +370,19 @@ MAIN-P non-nil means AGENT is a top-level agent (escalate -> confirm)."
       (setq level 'deny))
     (when (and main-p (eq level 'escalate))
       (setq level 'confirm))
-    (cons level (cdr hit))))
+    (let ((decision (cons level (cdr hit))))
+      (dolist (fn gptel-fleet-decide-post-functions)
+        (setq decision (funcall fn agent tool-name args decision)))
+      (when (and main-p (eq (car decision) 'escalate))
+        (setq decision (cons 'confirm (cdr decision))))
+      decision)))
 
 (defun gptel-fleet-describe-source (source)
   "Human readable description of a decision SOURCE."
   (pcase source
     (`(floor ,r) (format "floor rule %S" r))
+    (`(model-override ,agent ,model ,allowed)
+     (format "per-task model %s is not in %s's :models %S" model agent allowed))
     (`(agent ,r) (format "agent rule %S" r))
     (`(session ,r) (format "session-learned %S" r))
     (`(learned ,r) (format "learned %S" r))

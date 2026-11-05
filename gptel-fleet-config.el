@@ -23,6 +23,7 @@
 (require 'gptel-fleet-core)
 (require 'gptel-fleet-policy)
 (require 'gptel-fleet-skills)
+(require 'gptel-fleet-models)
 
 (declare-function gptel-fleet-apply "gptel-fleet")
 (declare-function gptel-fleet-policy-matrix "gptel-fleet-list")
@@ -114,6 +115,8 @@ Strings starting with \"warning:\" do not block saving."
                           (models (gptel-backend-models b)))
                 (unless (memq v (mapcar (lambda (m) (if (consp m) (car m) m)) models))
                   (err "warning: model %s not listed for backend %s" v (gptel-backend-name b))))))
+           (:models
+            (dolist (p (gptel-fleet-validate-models-list v)) (err "%s" p)))
            (:tools
             (if (not (and (listp v) (cl-every #'stringp v)))
                 (err ":tools must be a list of tool name strings")
