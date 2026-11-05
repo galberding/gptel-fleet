@@ -36,6 +36,8 @@
 (declare-function gptel--reject-tool-calls "gptel")
 (declare-function gptel--steer-tool-calls "gptel")
 (declare-function gptel--inspect-tool-calls "gptel")
+(declare-function gptel-fleet-ask-answer-inline "gptel-fleet-ask")
+(declare-function gptel-fleet-ask-answer-request "gptel-fleet-ask")
 
 (defcustom gptel-fleet-approval-ui 'inline
   "Where `confirm' calls are approved.
@@ -159,6 +161,14 @@ actually used: %s]\n" (prin1-to-string (gptel-fleet-request-args req)))))
 
 (defun gptel-fleet-answer (req key)
   "Apply answer KEY (a character) to REQ."
+  (if (equal (gptel-fleet-request-tool-name req) "AskUser")
+      (pcase key
+        ((or ?y ?e ?s ?S ?a ?A) (gptel-fleet-ask-answer-request req))
+        ((or ?n ?d) (gptel-fleet-ask-answer-request req t)))
+    (gptel-fleet--answer-change-or-call req key)))
+
+(defun gptel-fleet--answer-change-or-call (req key)
+  "Apply answer KEY to REQ, a tool call or fleet change."
   (let ((agent (plist-get (gptel-fleet-request-ctx req) :agent)))
     (when (and (gptel-fleet-request-no-learn req) (memq key '(?s ?S ?a ?A ?e)))
       (message "gptel-fleet: this request cannot be learned or edited; treated as `y'")
@@ -471,7 +481,12 @@ VALUES is the working copy of all argument values (default: REQ's)."
                                 (mapconcat (lambda (c) (gptel-tool-name (car c))) calls ",")
                                 (format "inline %s" (buffer-name buf))
                                 (gptel-fleet--one-line
-                                 (mapconcat (lambda (c) (prin1-to-string (cadr c))) calls " ")
+                                 (mapconcat (lambda (c)
+                                              (let ((m (plist-get (cadr c) :model)))
+                                                (concat (if (gptel-fleet--set-p m)
+                                                            (format "[model %s] " m) "")
+                                                        (prin1-to-string (cadr c)))))
+                                            calls " ")
                                  120))))
          (mapcar (lambda (req)
                    (list req
@@ -516,26 +531,36 @@ VALUES is the working copy of all argument values (default: REQ's)."
   "Answer inline ENTRY (inline BUF OV CALLS) with KEY."
   (pcase-let ((`(inline ,buf ,ov ,calls) entry))
     (unless (overlay-buffer ov) (user-error "Already answered"))
-    (when (memq key '(?s ?S ?a ?A))
-      (dolist (c calls)
-        (let* ((tok (gptel-fleet--inline-token c))
-               (agent (plist-get (plist-get tok :ctx) :agent))
-               (tool (gptel-tool-name (car c))))
-          (when agent
-            (gptel-fleet-learn
-             agent
-             (if (memq key '(?S ?A)) `(allow :tool ,tool)
-               `(allow :tool ,tool
-                       :args ,(cl-loop for (k v) on (cadr c) by #'cddr
-                                       collect (list k :equal v))))
-             (memq key '(?a ?A)))))))
-    (pcase key
-      ((or ?y ?s ?S ?a ?A)
-       (with-current-buffer buf (gptel--accept-tool-calls calls ov)))
-      (?n (with-current-buffer buf (gptel--reject-tool-calls calls ov)))
-      (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls))
-      (?e (gptel-fleet--inline-jump buf ov #'gptel--inspect-tool-calls)))
+    (if (cl-some (lambda (c) (equal (gptel-tool-name (car c)) "AskUser")) calls)
+        ;; A question: answer it (minibuffer, since you asked for it here).
+        (pcase key
+          ((or ?y ?e ?s ?S ?a ?A) (gptel-fleet-ask-answer-inline buf ov calls))
+          (?n (gptel-fleet-ask-answer-inline buf ov calls t))
+          (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls)))
+      (gptel-fleet--answer-inline-call buf ov calls key))
     (gptel-fleet-update-indicator)))
+
+(defun gptel-fleet--answer-inline-call (buf ov calls key)
+  "Answer gptel's pending CALLS at OV in BUF with KEY."
+  (when (memq key '(?s ?S ?a ?A))
+    (dolist (c calls)
+      (let* ((tok (gptel-fleet--inline-token c))
+             (agent (plist-get (plist-get tok :ctx) :agent))
+             (tool (gptel-tool-name (car c))))
+        (when agent
+          (gptel-fleet-learn
+           agent
+           (if (memq key '(?S ?A)) `(allow :tool ,tool)
+             `(allow :tool ,tool
+                     :args ,(cl-loop for (k v) on (cadr c) by #'cddr
+                                     collect (list k :equal v))))
+           (memq key '(?a ?A)))))))
+  (pcase key
+    ((or ?y ?s ?S ?a ?A)
+     (with-current-buffer buf (gptel--accept-tool-calls calls ov)))
+    (?n (with-current-buffer buf (gptel--reject-tool-calls calls ov)))
+    (?d (gptel-fleet--inline-jump buf ov #'gptel--steer-tool-calls))
+    (?e (gptel-fleet--inline-jump buf ov #'gptel--inspect-tool-calls))))
 
 (defun gptel-fleet--queue-answer (key)
   "Answer the entry at point with KEY."
