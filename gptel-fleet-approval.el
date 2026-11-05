@@ -580,10 +580,26 @@ All bindings:
   (setq tabulated-list-padding 1)
   (tabulated-list-init-header))
 
+(defun gptel-fleet--inline-call-position (ov)
+  "Position of the pending calls' prompt inside gptel's tool overlay OV.
+OV itself starts at the beginning of the whole response (or of the
+buffer), often far above the calls.  The \"... wants to run:\" header
+is drawn before gptel's prompt overlays; a question has its own overlay."
+  (with-current-buffer (overlay-buffer ov)
+    (or (when-let* ((ask (cl-find-if (lambda (o) (overlay-get o 'gptel-fleet-ask))
+                                     (overlays-in (overlay-start ov) (overlay-end ov)))))
+          (overlay-start ask))
+        (cl-loop for p in (overlay-get ov 'prompt)
+                 when (overlay-buffer p) minimize (overlay-start p))
+        (overlay-end ov))))
+
 (defun gptel-fleet--inline-jump (buf ov &optional command)
-  "Show the inline call OV in BUF; run COMMAND there interactively."
-  (pop-to-buffer buf)
-  (goto-char (overlay-start ov))
+  "Show the inline call OV in BUF at its prompt; run COMMAND there interactively."
+  (let ((pos (gptel-fleet--inline-call-position ov)))
+    (pop-to-buffer buf)
+    (goto-char pos)
+    (when (eq (window-buffer) buf)
+      (recenter)))
   (when command (call-interactively command)))
 
 (defun gptel-fleet--answer-inline (entry key)
