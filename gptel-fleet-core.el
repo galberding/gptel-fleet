@@ -20,6 +20,9 @@
 ;;   :delegate      t/nil   Offer it as a subagent_type to other agents.
 ;;   :backend       STRING  gptel backend name (`gptel-get-backend').
 ;;   :model         SYMBOL  model of that backend.
+;;   :models        LIST    "Backend:model" strings (globs allowed) the
+;;                          agent may be given per delegation without
+;;                          asking (see gptel-fleet-models.el).
 ;;   :tools         LIST    Replace the frontmatter tool list (names).
 ;;   :tool-packages LIST    Add every tool of these packages (symbols).
 ;;   :skills        LIST    Visible skills (names or globs); () = none,
@@ -65,8 +68,8 @@ is where the forge writes new packages."
   :type '(repeat string))
 
 (defconst gptel-fleet-override-keys
-  '(:enabled :delegate :backend :model :tools :tool-packages :skills :profile
-    :policy :log :log-dir :preset :notes)
+  '(:enabled :delegate :backend :model :models :tools :tool-packages :skills
+    :profile :policy :log :log-dir :preset :notes)
   "Keys allowed in an agent override file.")
 
 ;;;; Paths
@@ -128,6 +131,9 @@ is where the forge writes new packages."
       (pp data (current-buffer)))))
 
 ;;;; Override registry
+
+(defvar gptel-fleet--model-override nil
+  "Plist (:backend :model :requested) while a per-task model is applied.")
 
 (defvar gptel-fleet--overrides nil
   "Alist of (AGENT-NAME . PLIST) read from the override directory.")

@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Georg Alberding
 
 ;; Author: Georg Alberding <galberding@web.de>
-;; Version: 0.5.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "29.1") (gptel "0.9.9") (gptel-agent "0.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/galberding/gptel-fleet
@@ -25,6 +25,11 @@
 ;;   validated on save, merged into gptel-agent's agent table, so the
 ;;   bundled agents never need editing.  This is how a subagent gets its
 ;;   own (cheaper) model.
+;; - Per-task models: the Agent tool's optional `model' argument runs one
+;;   delegation on another model, within the agent's `:models' allowlist
+;;   or with your approval (gptel-fleet-models.el).
+;; - AskUser: agents ask you multiple-choice questions, answered inline
+;;   or from the queue (gptel-fleet-ask.el).
 ;; - Graded approvals (deny / escalate / dry-run / confirm / notify /
 ;;   allow) per agent, package, tool and argument pattern, replacing
 ;;   gptel's t / nil / auto.  See gptel-fleet-policy.el.
@@ -52,6 +57,8 @@
 (require 'gptel-fleet-approval)
 (require 'gptel-fleet-tools)
 (require 'gptel-fleet-skills)
+(require 'gptel-fleet-models)
+(require 'gptel-fleet-ask)
 (require 'gptel-fleet-config)
 (require 'gptel-fleet-list)
 (require 'gptel-fleet-forge)
@@ -105,6 +112,11 @@ instead of aborting the whole update."
       (setq p (plist-put p :tools (gptel-fleet--effective-tools name plist))))
     (cl-loop for (k v) on (plist-get cfg :preset) by #'cddr
              when (memq k gptel-fleet--preset-keys) do (setq p (plist-put p k v)))
+    (when (and (gptel-fleet-ask-agent-p name)
+               (ignore-errors (gptel-get-tool gptel-fleet-ask-tool-name))
+               (not (member gptel-fleet-ask-tool-name (plist-get p :tools))))
+      (setq p (plist-put p :tools (append (plist-get p :tools)
+                                          (list gptel-fleet-ask-tool-name)))))
     p))
 
 (defcustom gptel-fleet-append-roster t
@@ -123,14 +135,18 @@ are listed below; ignore any other agent named elsewhere in these instructions.\
    (mapconcat
     (lambda (e)
       (let ((p (cdr e)))
-        (format "- %s (%s:%s): %s" (car e)
+        (format "- %s (%s:%s%s): %s" (car e)
                 (let ((b (plist-get p :backend)))
                   (cond ((stringp b) b) ((and b (gptel-backend-p b)) (gptel-backend-name b))
                         (t "default")))
                 (or (plist-get p :model) "default")
+                (gptel-fleet-roster-models (car e))
                 (gptel-fleet--one-line (or (plist-get p :description) "") 200))))
     (cl-remove-if-not (lambda (e) (gptel-fleet-delegate-p (car e))) gptel-agent--agents)
     "\n")
+   "\nThe Agent tool's optional `model' argument (\"Backend:model\") runs one \
+task on another model; models not listed above for that agent need the \
+user's approval."
    "\n</fleet_subagents>"))
 
 (defun gptel-fleet--agent-update-advice (orig)
@@ -146,6 +162,7 @@ are listed below; ignore any other agent named elsewhere in these instructions.\
                   gptel-agent--agents))
     ;; Delegation targets: enabled and :delegate not nil.  Defaults match
     ;; gptel-agent: everything except "gptel-agent" itself.
+    (gptel-fleet--agent-tool-add-model-arg)
     (when-let* ((agent-tool (gptel-get-tool "Agent")))
       (setf (plist-get (car (gptel-tool-args agent-tool)) :enum)
             (vconcat (cl-loop for (name . _) in gptel-agent--agents
@@ -196,6 +213,7 @@ Live main-agent buffers are refreshed unless NO-BUFFERS."
                  (file-name-as-directory gptel-fleet-agent-source-directory) t))
   (gptel-fleet-load-tool-packages)
   (gptel-fleet-register-api-tools)
+  (gptel-fleet-register-ask-tool)
   (gptel-fleet-adopt-all)
   (gptel-agent-update)
   (unless no-buffers
@@ -223,7 +241,13 @@ Live main-agent buffers are refreshed unless NO-BUFFERS."
     (gptel-send :before gptel-fleet--send-advice)
     (gptel--accept-tool-calls :after gptel-fleet--refresh-advice)
     (gptel--reject-tool-calls :after gptel-fleet--forget-calls-advice)
-    (gptel--steer-tool-calls :after gptel-fleet--forget-calls-advice)))
+    (gptel--steer-tool-calls :after gptel-fleet--forget-calls-advice)
+    ;; Added last, so it is the outermost advice on `gptel-agent--task':
+    ;; the per-task model is in place before the log advice records it.
+    (gptel-agent--task :around gptel-fleet--model-task-advice)
+    (gptel-agent--task-overlay :around gptel-fleet--task-overlay-advice)
+    (gptel-agent--task-preview-setup :around gptel-fleet--task-preview-advice)
+    (gptel--display-tool-calls :around gptel-fleet--ask-display-advice)))
 
 ;;;###autoload
 (define-minor-mode gptel-fleet-mode
@@ -239,6 +263,7 @@ Live main-agent buffers are refreshed unless NO-BUFFERS."
         (add-hook 'gptel-post-tool-call-functions #'gptel-fleet--post-tool-hook)
         (add-hook 'gptel-post-response-functions #'gptel-fleet--post-response-hook)
         (gptel-fleet-install-handlers)
+        (add-hook 'gptel-fleet-decide-post-functions #'gptel-fleet--model-decide)
         (add-hook 'gptel-pre-tool-call-functions #'gptel-fleet--decide-hook 90)
         (unless (member 'gptel-fleet-mode-line global-mode-string)
           (setq global-mode-string (append (or global-mode-string '("")) '(gptel-fleet-mode-line))))
@@ -251,6 +276,8 @@ Live main-agent buffers are refreshed unless NO-BUFFERS."
     (remove-hook 'gptel-post-tool-call-functions #'gptel-fleet--post-tool-hook)
     (remove-hook 'gptel-post-response-functions #'gptel-fleet--post-response-hook)
     (gptel-fleet-uninstall-handlers)
+    (remove-hook 'gptel-fleet-decide-post-functions #'gptel-fleet--model-decide)
+    (gptel-fleet--agent-tool-remove-model-arg)
     (gptel-fleet-unadopt-all)
     (gptel-agent-update)))
 
