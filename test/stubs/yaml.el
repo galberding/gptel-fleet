@@ -1,0 +1,31 @@
+;;; yaml.el --- minimal test stub for frontmatter  -*- lexical-binding: t -*-
+;; Supports "key: value", "key: >" folded blocks, and "key:" + "- item" lists.
+(require 'subr-x)
+(defun yaml-parse-string (str &rest _)
+  (let ((lines (split-string str "\n")) out key mode acc)
+    (cl-flet ((flush ()
+                (when key
+                  (setq out (plist-put out (intern (concat ":" key))
+                                       (pcase mode
+                                         ('list (nreverse acc))
+                                         ('fold (string-join (nreverse acc) " "))
+                                         (_ acc))))
+                  (setq key nil mode nil acc nil))))
+      (dolist (l lines)
+        (cond
+         ((string-match "\\`\\([A-Za-z_-]+\\):\\s-*\\(.*\\)\\'" l)
+          (flush)
+          (setq key (match-string 1 l))
+          (let ((v (string-trim (match-string 2 l))))
+            (cond ((equal v ">") (setq mode 'fold))
+                  ((equal v "") (setq mode 'list))
+                  ((equal v "true") (setq acc t mode 'scalar))
+                  ((equal v "false") (setq acc :false mode 'scalar))
+                  (t (setq acc v mode 'scalar)))))
+         ((and key (string-match "\\`\\s-*-\\s-+\\(.*\\)\\'" l))
+          (setq mode 'list) (push (string-trim (match-string 1 l)) acc))
+         ((and key (eq mode 'fold) (not (string-blank-p l)))
+          (push (string-trim l) acc))))
+      (flush))
+    out))
+(provide 'yaml)
