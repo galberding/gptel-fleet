@@ -211,6 +211,7 @@ DESCRIPTION and PROMPT, under a fresh child context."
                                          (gptel-backend-name gptel-backend))))
                        :model (format "%s" (or (plist-get spec :model)
                                                (bound-and-true-p gptel-model)))
+                       :model_override (plist-get gptel-fleet--model-override :requested)
                        :tools (plist-get spec :tools)
                        :system_sha (gptel-fleet--store-prompt (plist-get spec :system)))))
          (logged-cb
