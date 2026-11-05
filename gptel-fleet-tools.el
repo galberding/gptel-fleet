@@ -243,11 +243,18 @@ fleet decides (:confirm nil)."
              (decision (gptel-fleet-decide (plist-get ctx :agent) name
                                            (gptel-fleet--arg-plist tool values)
                                            (plist-get ctx :main)))
-             (inline (and (eq (car decision) 'confirm)
+             (question (and (equal name "AskUser")
+                            (memq (car decision) '(confirm notify allow))))
+             (inline (and (or question (eq (car decision) 'confirm))
                           (eq gptel-fleet-approval-ui 'inline))))
+        ;; A question the agent may ask is answered, not approved: it runs
+        ;; as `allow', and gptel's inline prompt only hosts the answer UI.
+        (when question (setq decision (cons 'allow (cdr decision))))
         (gptel-fleet--put-token name values
                                 (list :ctx ctx :level (car decision) :source (cdr decision)
-                                      :inline inline :time (current-time)
+                                      :inline (and inline (not question))
+                                      :question (and inline question)
+                                      :time (current-time)
                                       :buffer (current-buffer)))
         (when inline (run-at-time 0 nil #'gptel-fleet-update-indicator))
         (list :confirm (and inline t))))))
