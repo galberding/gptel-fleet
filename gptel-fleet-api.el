@@ -128,7 +128,7 @@ self-promotion check uses all tools."
         (push (format "%s: %s %s → %s" (nth 0 d) (nth 1 d) (nth 2 d) (nth 3 d)) out)))
     (dolist (op ops)
       (pcase op
-        (`(:set ,agent ,(and key (or :tools :tool-packages :skills)) ,val)
+        (`(:set ,agent ,(and key (or :tools :tool-packages :skills :models)) ,val)
          (let* ((old (plist-get (cdr (assoc agent gptel-fleet--overrides)) key))
                 (inherited (not (plist-member (cdr (assoc agent gptel-fleet--overrides)) key)))
                 (added (cl-set-difference (ensure-list val) (ensure-list old) :test #'equal)))
@@ -458,8 +458,10 @@ asks; you get PENDING <id> back.  You can never widen yourself or your parent ag
     (unless (or p (gptel-fleet-config agent)) (error "Unknown agent %s" agent))
     (concat
      (format "# %s\nOverride: %S\n" agent (gptel-fleet-config agent))
-     (format "Effective: backend %s, model %s\nTools: %s\nSkills: %s\n"
+     (format "Effective: backend %s, model %s\nPer-task models without asking: %s\nTools: %s\nSkills: %s\n"
              (or (plist-get p :backend) "default") (or (plist-get p :model) "default")
+             (let ((ms (gptel-fleet-config-get agent :models)))
+               (if ms (string-join ms ", ") "none (any other model needs approval)"))
              (string-join (cl-remove-if-not #'stringp (plist-get p :tools)) " ")
              (let ((s (gptel-fleet-agent-skills agent))) (if (eq s t) "all" (string-join s " "))))
      "Levels (calls with no special args):\n"
